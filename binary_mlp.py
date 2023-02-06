@@ -12,8 +12,8 @@ class CircleModel(nn.Module):
             nn.ReLU(),
             nn.Linear(in_features=5, out_features=5),
             nn.ReLU(),
-            nn.Linear(in_features=5, out_features=5),
-            nn.ReLU(),
+            #nn.Linear(in_features=5, out_features=5),
+            #nn.ReLU(),
             nn.Linear(in_features=5, out_features=1),
             nn.ReLU()
         )
