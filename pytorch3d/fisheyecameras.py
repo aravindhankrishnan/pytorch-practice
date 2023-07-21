@@ -4,19 +4,25 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from pytorch3d.renderer import (
+    get_ndc_to_screen_transform,
+    get_screen_to_ndc_transform
+)
+
 import math
 from typing import List, Optional, Tuple, Union
 
 import torch
 from pytorch3d.common.datatypes import Device
 from pytorch3d.renderer.cameras import _R, _T, CamerasBase
+from pytorch3d.transforms import Rotate, Transform3d, Translate
 
 _focal_length = torch.tensor(((1.0,),))
 _principal_point = torch.tensor(((0.0, 0.0),))
 _radial_params = torch.tensor(((0.0, 0.0, 0.0, 0.0, 0.0, 0.0),))
 _tangential_params = torch.tensor(((0.0, 0.0),))
 _thin_prism_params = torch.tensor(((0.0, 0.0, 0.0, 0.0),))
-
+_K = torch.zeros(4, 4)  # (4, 4)
 
 class FishEyeCameras(CamerasBase):
     """
@@ -50,6 +56,7 @@ class FishEyeCameras(CamerasBase):
     """
 
     _FIELDS = (
+        "K",
         "focal_length",
         "principal_point",
         "R",
@@ -62,13 +69,15 @@ class FishEyeCameras(CamerasBase):
         "use_tangential",
         "use_tin_prism",
         "device",
+        "_in_ndc",  # arg is in_ndc but attribute set as _in_ndc
         "image_size",
     )
 
     def __init__(
         self,
-        focal_length=_focal_length,
-        principal_point=_principal_point,
+        K: torch.Tensor = _K,
+        focal_length = _focal_length,
+        principal_point = _principal_point,
         radial_params=_radial_params,
         tangential_params=_tangential_params,
         thin_prism_params=_thin_prism_params,
@@ -79,6 +88,7 @@ class FishEyeCameras(CamerasBase):
         use_tangential: bool = True,
         use_thin_prism: bool = True,
         device: Device = "cpu",
+        in_ndc: bool = True,
         image_size: Optional[Union[List, Tuple, torch.Tensor]] = None,
     ) -> None:
 
@@ -112,9 +122,11 @@ class FishEyeCameras(CamerasBase):
 
         kwargs = {"image_size": image_size} if image_size is not None else {}
         super().__init__(
-            device=device,
+            K=K,
             R=R,
             T=T,
+            device=device,
+            _in_ndc=in_ndc,
             **kwargs,  # pyre-ignore
         )
         if image_size is not None:
@@ -138,9 +150,32 @@ class FishEyeCameras(CamerasBase):
         self.epsilon = 1e-10
         self.num_distortion_iters = 50
 
+        self.K = self.K.to(self.device)
         self.R = self.R.to(self.device)
         self.T = self.T.to(self.device)
         self.num_radial = radial_params.shape[-1]
+
+    def get_principal_point(self, **kwargs) -> torch.Tensor:
+        """
+        Return the camera's principal point
+
+        Args:
+            **kwargs: parameters for the camera extrinsics can be passed in
+                as keyword arguments to override the default values
+                set in __init__.
+        """
+        print('In FishEyeCameras::get_principal_point')
+        K = kwargs.get("K", self.K)
+        print('Shape of K ', K.size())
+        assert K is not None
+        if K.shape != (self._N, 4, 4):
+            msg = "Expected K to have shape of (%r, 4, 4)"
+            raise ValueError(msg % (self._N))
+
+        proj_mat = Transform3d(
+            matrix=K.transpose(1, 2).contiguous(), device=self.device
+        ).get_matrix()
+        return proj_mat[:, 2, :2]
 
     def _project_points_batch(
         self,
@@ -170,6 +205,7 @@ class FishEyeCameras(CamerasBase):
                 (1, P, 3) or (M, P, 3)
 
         """
+        print('In FishEyeCameras::_project_points_batch')
         assert points.shape[-1] == 3, "points shape incorrect"
         ab = points[..., :2] / points[..., 2:]
         uv_distorted = ab
@@ -251,12 +287,53 @@ class FishEyeCameras(CamerasBase):
                 return False
         return True
 
+    def get_ndc_camera_transform(self, **kwargs) -> Transform3d:
+        """
+        Returns the transform from camera projection space (screen or NDC) to NDC space.
+        If the camera is defined already in NDC space, the transform is identity.
+        For cameras defined in screen space, we adjust the principal point computation
+        which is defined in the image space (commonly) and scale the points to NDC space.
+
+        This transform leaves the depth unchanged.
+
+        Important: This transforms assumes PyTorch3D conventions for the input points,
+        i.e. +X left, +Y up.
+        """
+        print('In FishEyeCameras::get_ndc_camera_transform', self.in_ndc())
+        if self.in_ndc():
+            ndc_transform = Transform3d(device=self.device, dtype=torch.float32)
+        else:
+            # when cameras are defined in screen/image space, the principal point is
+            # provided in the (+X right, +Y down), aka image, coordinate system.
+            # Since input points are defined in the PyTorch3D system (+X left, +Y up),
+            # we need to adjust for the principal point transform.
+            pr_point_fix = torch.zeros(
+                (self._N, 4, 4), device=self.device, dtype=torch.float32
+            )
+            pr_point_fix[:, 0, 0] = 1.0
+            pr_point_fix[:, 1, 1] = 1.0
+            pr_point_fix[:, 2, 2] = 1.0
+            pr_point_fix[:, 3, 3] = 1.0
+            pr_point_fix[:, :2, 3] = -2.0 * self.get_principal_point(**kwargs)
+            pr_point_fix_transform = Transform3d(
+                matrix=pr_point_fix.transpose(1, 2).contiguous(), device=self.device
+            )
+            print('PR point fix transform', pr_point_fix_transform.get_matrix())
+            image_size = kwargs.get("image_size", self.get_image_size())
+            screen_to_ndc_transform = get_screen_to_ndc_transform(self, with_xyflip=False, image_size=image_size
+            )
+            print('Screen to NDC transform', screen_to_ndc_transform.get_matrix())
+            ndc_transform = pr_point_fix_transform.compose(screen_to_ndc_transform)
+
+        print('In FishEyeCameras::get_ndc_camera_transform complete')
+        return ndc_transform
+
     def transform_points(
         self, points, eps: Optional[float] = None, **kwargs
     ) -> torch.Tensor:
         """
         Transform input points from camera space to image space.
-        Args:
+        Args:True
             points: tensor of (..., 3). E.g., (P, 3) or (1, P, 3), (M, P, 3)
             eps: tiny number to avoid zero divsion
 
@@ -266,6 +343,7 @@ class FishEyeCameras(CamerasBase):
             when points take shape (M, P, 3), output is (M, P, 3)
             where N is the number of transforms, P number of points
         """
+        print('In FishEyeCameras::transform_points')
         # project from world space to camera space
         if self.world_coordinates:
             world_to_view_transform = self.get_world_to_view_transform(
@@ -330,6 +408,7 @@ class FishEyeCameras(CamerasBase):
         Returns:
             point3d_est: (..., 3)
         """
+        print('In FishEyeCameras::_unproject_points_batch')
         sh = list(xy.shape[:-1])
         assert xy.shape[-1] == 2, "xy_depth shape incorrect"
         uv_distorted = (xy - principal_point) / focal
@@ -376,6 +455,7 @@ class FishEyeCameras(CamerasBase):
             when points take shape (M, P, 3), output is (M, P, 3)
             where N is the number of transforms, P number of point
         """
+        print('In FishEyeCameras::unprojected_points')
         xy_depth = xy_depth.to(self.device)
         N = len(self.radial_params)
         if N == 1:
@@ -417,6 +497,7 @@ class FishEyeCameras(CamerasBase):
         Returns:
             xr_yr: (..., 2)
         """
+        print('In FishEyeCameras::_compute_xr_yr_from_uv_distorted')
         # early exit if we're not using any tangential/ thin prism distortions
         if not self.use_tangential and not self.use_thin_prism:
             return uv_distorted
@@ -478,6 +559,7 @@ class FishEyeCameras(CamerasBase):
         Returns:
             th: angle theta (in radians) of shape (...), E.g., (P), (1, P), (M, P)
         """
+        print('In FishEyeCameras::_get_theta_from_norm_xr_yr')
         sh = list(th_radial_desired.shape)
         th = th_radial_desired
         c = torch.tensor(
@@ -531,6 +613,7 @@ class FishEyeCameras(CamerasBase):
         Returns:
             duv_distorted_dxryr: (..., 2, 2) Jacobian
         """
+        print('In FishEyeCameras::_compute_duv_distorted_dxryr')
         sh = list(xr_yr.shape[:-1])
         duv_distorted_dxryr = torch.empty((*sh, 2, 2), device=self.device)
         if self.use_tangential:
@@ -578,7 +661,7 @@ class FishEyeCameras(CamerasBase):
         return duv_distorted_dxryr
 
     def in_ndc(self):
-        return True
+        return self._in_ndc;
 
     def is_perspective(self):
         return False
